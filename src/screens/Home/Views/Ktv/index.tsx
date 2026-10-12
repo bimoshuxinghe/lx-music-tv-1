@@ -3,6 +3,8 @@ import {
   View,
   FlatList,
   StyleSheet,
+  Animated,
+  Easing,
   useWindowDimensions,
   DeviceEventEmitter,
   type NativeSyntheticEvent,
@@ -10,7 +12,7 @@ import {
 } from 'react-native'
 import Video, { type VideoRef } from 'react-native-video'
 import { FocusableTouchableOpacity as TouchableOpacity } from '@/components/tv/FocusableTouchableOpacity'
-import Text from '@/components/common/Text'
+import Text, { AnimatedText } from '@/components/common/Text'
 import { IconMaterial } from '@/components/common/Icon'
 import Image from '@/components/common/Image'
 import Input, { type InputType } from '@/components/common/Input'
@@ -20,80 +22,155 @@ import { scaleSizeW } from '@/utils/pixelRatio'
 import { BorderWidths } from '@/theme'
 import { useBackHandler } from '@/utils/hooks/useBackHandler'
 import { setNavActiveId } from '@/core/common'
-import { setFullscreenKeyCapture } from '@/utils/nativeModules/utils'
-import { adjustVolume } from '@/utils/nativeModules/utils'
+import { setFullscreenKeyCapture, adjustVolume } from '@/utils/nativeModules/utils'
 import { mvSingers, mvSongs, mvSearch, mvPlayer } from '@/utils/nativeModules/ktvSpider'
 import { getSingerAvatar, preloadSingerAvatars } from '@/utils/ktvAvatarCache'
 import { getLyricInfo } from '@/core/music'
 import { setLyric, play as playLyric, pause as pauseLyric, useLrcSet, useLrcWords, useLrcPlay } from '@/plugins/lyric'
-import { getPosition } from '@/plugins/player/utils'
-import LrcWord from '@/screens/PlayDetail/components/LrcWord'
-import { type Line } from '@/plugins/lyric'
+import { type Line, type Word } from '@/plugins/lyric'
 
-// ============ LRC歌词叠加层组件 ============
+// ============ KTV逐字歌词 ============
 /**
- * LRC歌词叠加层：底部固定区域，显示当前播放的歌词。
- * 卡拉OK风格：当前行放大高亮+逐字渐亮，上下文行缩小灰色。
+ * KTV逐字歌词单字：双层文字渲染（底层白字 + 顶层红字）。
+ * 唱到该字时顶层红字 opacity 0→1（原生 UI 线程驱动，时长跟随字时长），
+ * 实现卡拉OK式"白→红"逐字填充；未唱字保持白色。
+ */
+const KtvLrcWord = memo(({ word, active, size, lineHeight }: {
+  word: Word
+  active: boolean
+  size: number
+  lineHeight: number
+}) => {
+  const anim = useRef(new Animated.Value(0)).current
+  const startedRef = useRef(false)
+
+  useEffect(() => {
+    if (active) {
+      if (startedRef.current) return
+      startedRef.current = true
+      const duration = word.duration > 0
+        ? Math.min(Math.max(word.duration, 120), 800)
+        : 300
+      Animated.timing(anim, {
+        toValue: 1,
+        duration,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }).start()
+    } else {
+      startedRef.current = false
+      anim.setValue(0)
+    }
+  }, [active, anim, word.duration])
+
+  const sungOpacity = anim
+  const unsungOpacity = anim.interpolate({ inputRange: [0, 1], outputRange: [1, 0] })
+
+  return (
+    <View>
+      <AnimatedText
+        size={size}
+        color="#FFFFFF"
+        style={[styles.lrcTextShadow, { lineHeight, opacity: unsungOpacity }]}
+      >
+        {word.text}
+      </AnimatedText>
+      <AnimatedText
+        size={size}
+        color={ACCENT_RED}
+        style={[styles.lrcWordSung, styles.lrcTextShadow, { lineHeight, opacity: sungOpacity }]}
+      >
+        {word.text}
+      </AnimatedText>
+    </View>
+  )
+})
+
+/**
+ * KTV歌词叠加层：底部固定两行，居中排列。
+ * 上一行：已唱完，白色大字；当前行：逐字"白→红"卡拉OK填充。
+ * 按视频实际播放进度驱动点亮，无逐字数据时退化为整行红字显示。
  */
 const LrcOverlay = memo(({
   lines,
   wordLinesMap,
   activeLine,
-  theme,
+  getTime,
   showControls,
 }: {
   lines: Line[]
-  wordLinesMap: Map<number, import('@/plugins/lyric').Word[]>
+  wordLinesMap: Map<number, Word[]>
   activeLine: number
-  theme: ReturnType<typeof useTheme>
+  getTime: () => number
   showControls: boolean
 }) => {
   const { width: winW } = useWindowDimensions()
-  const baseFontSize = Math.max(14, winW * 0.025)
-  const activeFontSize = Math.max(22, winW * 0.04)
+  const prevFontSize = Math.max(18, winW * 0.034)
+  const activeFontSize = Math.max(22, winW * 0.042)
 
-  // 计算当前行前后各2行的范围
-  const startLine = Math.max(0, activeLine - 2)
-  const endLine = Math.min(lines.length - 1, activeLine + 2)
+  const curLine = activeLine >= 0 ? lines[activeLine] : null
+  const curWords = useMemo(
+    () => (activeLine >= 0 ? wordLinesMap.get(activeLine) ?? [] : []),
+    [activeLine, wordLinesMap],
+  )
+
+  // 当前行内已播放时长（ms，可为负=行未开始），驱动逐字点亮；100ms 轮询视频进度
+  // 不做 0 钳位：否则行开始前/歌词加载后首词（偏移0）会被提前点亮
+  const [wordProgress, setWordProgress] = useState(0)
+  useEffect(() => {
+    if (!curLine || curWords.length === 0) {
+      setWordProgress(0)
+      return
+    }
+    const update = () => {
+      setWordProgress(getTime() * 1000 - curLine.time)
+    }
+    update()
+    const timer = setInterval(update, 100)
+    return () => { clearInterval(timer) }
+  }, [curLine, curWords, getTime])
 
   if (lines.length === 0 || activeLine < 0) return null
 
+  const prevLineNum = activeLine - 1
+  const prevLine = prevLineNum >= 0 ? lines[prevLineNum] : null
+
   return (
     <View style={[styles.lrcOverlay, { bottom: showControls ? 120 : 80 }]}>
-      {Array.from({ length: endLine - startLine + 1 }, (_, i) => startLine + i).map((lineNum) => {
-        const line = lines[lineNum]
-        if (!line) return null
-        const isActive = lineNum === activeLine
-        const words = wordLinesMap.get(lineNum) ?? []
-        return (
-          <View
-            key={lineNum}
-            style={[styles.lrcLine, isActive && styles.lrcLineActive]}
+      {prevLine && (
+        <View style={styles.lrcLine}>
+          <Text
+            size={prevFontSize}
+            color="#FFFFFF"
+            style={[styles.lrcTextShadow, { lineHeight: prevFontSize * 1.35 }]}
           >
-            {words.length > 0
-              ? words.map((word, wi) => (
-                  <LrcWord
-                    key={wi}
-                    word={word}
-                    active={isActive}
-                    size={isActive ? activeFontSize : baseFontSize}
-                    color={isActive ? theme['c-primary'] : '#FFFFFF88'}
-                    lineHeight={isActive ? activeFontSize * 1.4 : baseFontSize * 1.4}
-                  />
-                ))
-              : (
-                  <Text
-                    size={isActive ? activeFontSize : baseFontSize}
-                    color={isActive ? theme['c-primary'] : '#FFFFFF88'}
-                    style={{ lineHeight: isActive ? activeFontSize * 1.4 : baseFontSize * 1.4 }}
-                  >
-                    {line.text}
-                  </Text>
-                )
-            }
-          </View>
-        )
-      })}
+            {prevLine.text}
+          </Text>
+        </View>
+      )}
+      {curLine && (
+        <View style={styles.lrcLine}>
+          {curWords.length > 0
+            ? curWords.map((word, wi) => (
+                <KtvLrcWord
+                  key={wi}
+                  word={word}
+                  active={wordProgress >= word.time}
+                  size={activeFontSize}
+                  lineHeight={activeFontSize * 1.35}
+                />
+              ))
+            : (
+                <Text
+                  size={activeFontSize}
+                  color={ACCENT_RED}
+                  style={[styles.lrcTextShadow, { lineHeight: activeFontSize * 1.35 }]}
+                >
+                  {curLine.text}
+                </Text>
+              )}
+        </View>
+      )}
     </View>
   )
 })
@@ -217,6 +294,9 @@ export default () => {
   const progressRef = useRef(progress)
   progressRef.current = progress
 
+  // 歌词逐字点亮用：读取视频当前播放秒数（稳定引用，避免逐帧重建回调）
+  const getVideoTime = useCallback(() => progressRef.current.time, [])
+
   // 左右键快进/快退（秒）
   const SEEK_STEP = 10
   const seekBy = useCallback((delta: number) => {
@@ -225,7 +305,9 @@ export default () => {
     const target = Math.max(0, Math.min(duration, cur.time + delta))
     if (videoRef.current) videoRef.current.seek(target)
     setProgress(p => ({ ...p, time: target }))
-  }, [])
+    // seek 后立即重同步歌词时钟（播放中）；暂停时保持歌词时钟停止，恢复播放时再同步
+    if (!paused) playLyric(target * 1000)
+  }, [paused])
 
   const gender = activeTab == 'female' ? 2 : 1
 
@@ -490,13 +572,15 @@ export default () => {
             setVideoSize(ns && ns.width > 0 && ns.height > 0 ? { w: ns.width, h: ns.height } : null)
           }}
           onProgress={(e: any) => { setProgress(p => ({ ...p, time: e?.currentTime ?? p.time })) }}
+          progressUpdateInterval={200}
           onEnd={onEnd}
           onError={(e: any) => { toast(`播放出错：${e?.error?.localizedDescription ?? e?.error ?? ''}`) }}
           onPlaybackStateChanged={(e: any) => {
             const isPlaying = e?.isPlaying
             if (isPlaying !== undefined) {
               setPaused(!isPlaying)
-              if (isPlaying) playLyric(progress.time)
+              // lrc-file-parser 的 play(time) 期望毫秒（与主播放器 handlePlay(position*1000) 一致）
+              if (isPlaying) playLyric(progressRef.current.time * 1000)
               else pauseLyric()
             }
           }}
@@ -533,13 +617,13 @@ export default () => {
         </TouchableOpacity>
       )}
 
-      {/* LRC歌词叠加层：卡拉OK风格，底部固定显示 */}
+      {/* KTV歌词叠加层：底部两行，当前行逐字白→红填充 */}
       {fullScreen && lrcLines.length > 0 && (
         <LrcOverlay
           lines={lrcLines}
           wordLinesMap={wordLinesMap}
           activeLine={activeLine}
-          theme={theme}
+          getTime={getVideoTime}
           showControls={showControls}
         />
       )}
@@ -1187,20 +1271,31 @@ const styles = createStyle({
   menuRowDur: {
     marginRight: 8,
   },
-  // LRC歌词叠加层样式
+  // KTV歌词叠加层样式
   lrcOverlay: {
     position: 'absolute',
-    bottom: 120,
+    bottom: 80,
     left: 0,
     right: 0,
     alignItems: 'center',
     zIndex: 10,
   },
   lrcLine: {
-    marginBottom: 4,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 2,
     paddingHorizontal: 16,
   },
-  lrcLineActive: {
-    marginBottom: 6,
+  lrcWordSung: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+  },
+  lrcTextShadow: {
+    textShadowColor: '#000000D9',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
   },
 })
